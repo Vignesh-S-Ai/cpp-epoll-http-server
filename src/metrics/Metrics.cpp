@@ -1,24 +1,37 @@
 #include "Metrics.hpp"
+#include <sstream>
 
-std::atomic<long> Metrics::total_requests(0);
-std::atomic<long> Metrics::active_connections(0);
+std::mutex Metrics::mtx;
+std::unordered_map<std::string, long> Metrics::total_latency;
+std::unordered_map<std::string, int> Metrics::success_count;
+std::unordered_map<std::string, int> Metrics::failure_count;
 
-void Metrics::incrementTotalRequests() {
-    total_requests++;
+void Metrics::recordSuccess(const std::string& url, long latency) {
+    std::lock_guard<std::mutex> lock(mtx);
+    total_latency[url] += latency;
+    success_count[url]++;
 }
 
-void Metrics::incrementActiveConnections() {
-    active_connections++;
+void Metrics::recordFailure(const std::string& url) {
+    std::lock_guard<std::mutex> lock(mtx);
+    failure_count[url]++;
 }
 
-void Metrics::decrementActiveConnections() {
-    active_connections--;
-}
+std::string Metrics::exportMetrics() {
+    std::lock_guard<std::mutex> lock(mtx);
+    std::ostringstream oss;
 
-long Metrics::getTotalRequests() {
-    return total_requests.load();
-}
+    for (auto& pair : success_count) {
+        const std::string& url = pair.first;
+        int success = pair.second;
+        int failure = failure_count[url];
+        long avg_latency = success > 0 ? total_latency[url] / success : 0;
 
-long Metrics::getActiveConnections() {
-    return active_connections.load();
+        oss << "site_success{url=\"" << url << "\"} " << success << "\n";
+        oss << "site_failure{url=\"" << url << "\"} " << failure << "\n";
+        oss << "site_avg_latency_ms{url=\"" << url << "\"} "
+            << avg_latency << "\n";
+    }
+
+    return oss.str();
 }

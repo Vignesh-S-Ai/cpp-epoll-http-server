@@ -10,6 +10,9 @@
 #include <sstream>
 #include <chrono>
 
+#include "monitoring/MonitorManager.hpp"
+#include "metrics/Metrics.hpp"
+
 constexpr int PORT = 8080;
 constexpr int MAX_EVENTS = 1024;
 constexpr int BUFFER_SIZE = 4096;
@@ -48,6 +51,12 @@ int main() {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
+    // Start Monitoring Engine
+    MonitorManager monitor;
+    monitor.addSite("google.com", 10);
+    monitor.addSite("example.com", 15);
+    monitor.start();
+
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     int opt = 1;
@@ -73,7 +82,7 @@ int main() {
 
     epoll_event events[MAX_EVENTS];
 
-    std::cout << "Hardened EPOLLET HTTP Server running on port "
+    std::cout << "Monitoring EPOLLET Server running on port "
               << PORT << "\n";
 
     while (running) {
@@ -87,7 +96,7 @@ int main() {
 
             int fd = events[i].data.fd;
 
-            // Accept new clients
+            // ACCEPT CLIENTS
             if (fd == server_fd) {
 
                 while (true) {
@@ -150,7 +159,7 @@ int main() {
                 }
             }
 
-            // Client readable
+            // READABLE
             else if (events[i].events & EPOLLIN) {
 
                 char buffer[BUFFER_SIZE];
@@ -161,21 +170,10 @@ int main() {
                         recv(fd, buffer,
                              sizeof(buffer), 0);
 
-                    if (bytes == -1) {
-                        if (errno == EAGAIN)
+                    if (bytes <= 0) {
+                        if (bytes == -1 && errno == EAGAIN)
                             break;
 
-                        close(fd);
-                        epoll_ctl(epoll_fd,
-                                  EPOLL_CTL_DEL,
-                                  fd,
-                                  nullptr);
-                        connections.erase(fd);
-                        active_connections--;
-                        break;
-                    }
-
-                    if (bytes == 0) {
                         close(fd);
                         epoll_ctl(epoll_fd,
                                   EPOLL_CTL_DEL,
@@ -211,8 +209,7 @@ int main() {
                 size_t header_end =
                     conn.read_buffer.find("\r\n\r\n");
 
-                if (header_end !=
-                    std::string::npos) {
+                if (header_end != std::string::npos) {
 
                     total_requests++;
 
@@ -224,12 +221,9 @@ int main() {
                     std::string method, path, version;
                     stream >> method >> path >> version;
 
-                    conn.keep_alive = true;
-
-                    if (request.find(
-                        "Connection: close")
-                        != std::string::npos)
-                        conn.keep_alive = false;
+                    conn.keep_alive =
+                        request.find("Connection: close")
+                        == std::string::npos;
 
                     std::string body;
                     std::string response;
@@ -239,35 +233,39 @@ int main() {
                         body =
                             "{\n"
                             "  \"total_requests\": " +
-                            std::to_string(
-                                total_requests.load()) +
+                            std::to_string(total_requests.load()) +
                             ",\n"
                             "  \"active_connections\": " +
-                            std::to_string(
-                                active_connections.load()) +
+                            std::to_string(active_connections.load()) +
                             "\n}";
 
                         response =
                             "HTTP/1.1 200 OK\r\n"
-                            "Content-Type: application/json\r\n"
-                            "Content-Length: " +
-                            std::to_string(
-                                body.size()) +
-                            "\r\n";
+                            "Content-Type: application/json\r\n";
 
-                    } else {
+                    }
+                    else if (path == "/metrics") {
 
-                        body =
-                            "Hardened EPOLLET Server";
+                        body = Metrics::exportMetrics();
 
                         response =
                             "HTTP/1.1 200 OK\r\n"
-                            "Content-Type: text/plain\r\n"
-                            "Content-Length: " +
-                            std::to_string(
-                                body.size()) +
-                            "\r\n";
+                            "Content-Type: text/plain\r\n";
+
                     }
+                    else {
+
+                        body = "Monitoring EPOLLET Server";
+
+                        response =
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/plain\r\n";
+                    }
+
+                    response +=
+                        "Content-Length: " +
+                        std::to_string(body.size()) +
+                        "\r\n";
 
                     if (conn.keep_alive)
                         response +=
@@ -292,7 +290,7 @@ int main() {
                 }
             }
 
-            // Client writable
+            // WRITABLE
             else if (events[i].events & EPOLLOUT) {
 
                 auto &conn = connections[fd];
@@ -305,8 +303,8 @@ int main() {
                              conn.write_buffer.size(),
                              0);
 
-                    if (sent == -1) {
-                        if (errno == EAGAIN)
+                    if (sent <= 0) {
+                        if (sent == -1 && errno == EAGAIN)
                             break;
 
                         close(fd);
@@ -350,7 +348,7 @@ int main() {
             }
         }
 
-        // Idle timeout sweep
+        // IDLE SWEEP
         auto now =
             std::chrono::steady_clock::now();
 
@@ -380,7 +378,9 @@ int main() {
         }
     }
 
+    monitor.stop();
     close(epoll_fd);
+
     std::cout << "Server stopped.\n";
     return 0;
-}
+    }

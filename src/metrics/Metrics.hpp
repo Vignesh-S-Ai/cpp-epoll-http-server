@@ -1,16 +1,17 @@
 #pragma once
-#include <atomic>
+#include <string>
+#include <unordered_map>
+#include <mutex>
 
 class Metrics {
 public:
-    static void incrementTotalRequests();
-    static void incrementActiveConnections();
-    static void decrementActiveConnections();
-
-    static long getTotalRequests();
-    static long getActiveConnections();
+    static void recordSuccess(const std::string& url, long latency);
+    static void recordFailure(const std::string& url);
+    static std::string exportMetrics();
 
 private:
-    static std::atomic<long> total_requests;
-    static std::atomic<long> active_connections;
+    static std::mutex mtx;
+    static std::unordered_map<std::string, long> total_latency;
+    static std::unordered_map<std::string, int> success_count;
+    static std::unordered_map<std::string, int> failure_count;
 };
