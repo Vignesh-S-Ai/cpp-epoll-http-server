@@ -1,0 +1,7 @@
+{
+    "sites": [
+      {"url": "google.com", "interval": 3},
+      {"url": "github.com", "interval": 5},
+      {"url": "amazon.com", "interval": 2}
+    ]
+  }

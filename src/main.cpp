@@ -9,8 +9,9 @@
 #include <unordered_map>
 #include <sstream>
 #include <chrono>
+#include "metrics/Metrics.hpp"
 
-#include "monitoring/MonitorManager.hpp"
+#include "Monitoring/MonitorManager.hpp"
 #include "metrics/Metrics.hpp"
 
 constexpr int PORT = 8080;
@@ -54,7 +55,7 @@ int main() {
     // Start Monitoring Engine
     MonitorManager monitor;
     monitor.addSite("google.com", 10);
-    monitor.addSite("example.com", 15);
+    monitor.addSite("nonexistent-xyz-12345.com", 10);
     monitor.start();
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);

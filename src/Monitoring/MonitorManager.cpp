@@ -31,14 +31,20 @@ void MonitorManager::schedulerLoop() {
                 if (now - site.last_checked >=
                     std::chrono::seconds(site.interval_sec)) {
 
-                    long latency;
-                    bool success =
-                        HttpClient::checkWebsite(site.host, latency);
+                    auto response =
+                        HttpClient::checkWebsite(site.host);
 
-                    if (success)
-                        Metrics::recordSuccess(site.host, latency);
+                    if (response.result ==
+                        HttpClient::CheckResult::SUCCESS)
+                    {
+                        Metrics::recordSuccess(
+                            site.host,
+                            response.latency_ms);
+                    }
                     else
+                    {
                         Metrics::recordFailure(site.host);
+                    }
 
                     site.last_checked = now;
                 }
