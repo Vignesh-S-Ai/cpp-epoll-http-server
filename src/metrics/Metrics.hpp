@@ -5,7 +5,8 @@ class Metrics {
 public:
     static void recordSuccess(
         const std::string& url,
-        long latency);
+        long latency,
+        size_t bytes);
 
     static void recordFailure(
         const std::string& url);

@@ -39,7 +39,8 @@ void MonitorManager::schedulerLoop() {
                     {
                         Metrics::recordSuccess(
                             site.host,
-                            response.latency_ms);
+                            response.latency_ms,
+                            response.bytes_received);
                     }
                     else
                     {
