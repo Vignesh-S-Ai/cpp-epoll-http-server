@@ -19,11 +19,16 @@ public:
         CheckResult result;
         long latency_ms;
         size_t bytes_received;
+        int status_code;   // NEW
 
         Response(CheckResult r = CheckResult::UNKNOWN_ERROR,
-                 long l = 0,
-                 size_t b = 0)
-            : result(r), latency_ms(l), bytes_received(b) {}
+                long l = 0,
+                size_t b = 0,
+                int sc = 0)
+            : result(r),
+            latency_ms(l),
+            bytes_received(b),
+            status_code(sc) {}
     };
 
     static Response checkWebsite(

@@ -116,7 +116,8 @@ void MonitorManager::schedulerLoop()
                     Metrics::recordSuccess(
                         site.host,
                         response.latency_ms,
-                        response.bytes_received);
+                        response.bytes_received,
+                        response.status_code);
 
                     site.local_consecutive_failures = 0;
 

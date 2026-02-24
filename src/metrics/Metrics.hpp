@@ -8,7 +8,8 @@ public:
     static void recordSuccess(
         const std::string& url,
         long latency,
-        size_t bytes);
+        size_t bytes,
+        int status_code);
 
     static void recordFailure(
         const std::string& url);

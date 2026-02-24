@@ -75,37 +75,68 @@ HttpClient::checkWebsite(const std::string& host,
     }
 
     // ---------------- RECEIVE ----------------
-    char buffer[4096];
-    size_t bytes_received = 0;
+        char buffer[4096];
+        size_t bytes_received = 0;
+        int status_code = 0;
+        bool status_parsed = false;
 
-    while (true) {
+        while (true) {
 
-        ssize_t bytes =
-            recv(sock,
-                 buffer,
-                 sizeof(buffer),
-                 0);
+            ssize_t bytes =
+                recv(sock,
+                    buffer,
+                    sizeof(buffer),
+                    0);
 
-        if (bytes > 0) {
-            bytes_received += bytes;
-        }
-        else if (bytes == 0) {
-            break;  // Normal close
-        }
-        else {
+            if (bytes > 0) {
 
-            if (errno == EAGAIN ||
-                errno == EWOULDBLOCK)
-            {
-                close(sock);
-                return Response(CheckResult::TIMEOUT);
+                bytes_received += bytes;
+
+                // Parse status line only once
+                if (!status_parsed) {
+
+                    std::string response_str(buffer, bytes);
+
+                    size_t pos = response_str.find("HTTP/");
+                    if (pos != std::string::npos) {
+
+                        size_t space1 =
+                            response_str.find(" ", pos);
+
+                        if (space1 != std::string::npos) {
+
+                            size_t space2 =
+                                response_str.find(" ", space1 + 1);
+
+                            if (space2 != std::string::npos) {
+
+                                status_code =
+                                    std::stoi(
+                                        response_str.substr(
+                                            space1 + 1,
+                                            space2 - space1 - 1));
+                                status_parsed = true;
+                            }
+                        }
+                    }
+                }
             }
+            else if (bytes == 0) {
+                break;
+            }
+            else {
 
-            close(sock);
-            return Response(CheckResult::RECEIVE_ERROR);
+                if (errno == EAGAIN ||
+                    errno == EWOULDBLOCK)
+                {
+                    close(sock);
+                    return Response(CheckResult::TIMEOUT);
+                }
+
+                close(sock);
+                return Response(CheckResult::RECEIVE_ERROR);
+            }
         }
-    }
-
     auto end =
         std::chrono::high_resolution_clock::now();
 
@@ -117,6 +148,7 @@ HttpClient::checkWebsite(const std::string& host,
     close(sock);
 
     return Response(CheckResult::SUCCESS,
-                    latency_ms,
-                    bytes_received);
+                latency_ms,
+                bytes_received,
+                status_code);
 }

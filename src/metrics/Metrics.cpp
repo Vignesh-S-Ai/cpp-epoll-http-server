@@ -19,6 +19,10 @@ struct SiteStats {
 
     int consecutive_failures = 0;
     int last_health = -1;
+    int http_2xx = 0;
+    int http_3xx = 0;
+    int http_4xx = 0;
+    int http_5xx = 0;
 
     long min_latency = std::numeric_limits<long>::max();
     long max_latency = 0;
@@ -132,7 +136,8 @@ static void evaluateAndAlert(
 void Metrics::recordSuccess(
     const std::string& url,
     long latency,
-    size_t bytes)
+    size_t bytes,
+    int status_code)
 {
     std::lock_guard<std::mutex> lock(mtx);
 
@@ -154,6 +159,16 @@ void Metrics::recordSuccess(
 
     if (s.latencies.size() > 1000)
         s.latencies.pop_front();
+
+    // ---------- HTTP CLASSIFICATION ----------
+    if (status_code >= 200 && status_code < 300)
+        s.http_2xx++;
+    else if (status_code >= 300 && status_code < 400)
+        s.http_3xx++;
+    else if (status_code >= 400 && status_code < 500)
+        s.http_4xx++;
+    else if (status_code >= 500)
+        s.http_5xx++;
 
     evaluateAndAlert(url, s);
 }
@@ -276,6 +291,17 @@ std::string Metrics::exportMetrics()
 
         ss << "site_health{url=\"" << url << "\"} "
            << health << "\n";
+        ss << "site_http_2xx_total{url=\"" << url << "\"} "
+             << s.http_2xx << "\n";
+
+        ss << "site_http_3xx_total{url=\"" << url << "\"} "
+            << s.http_3xx << "\n";
+
+        ss << "site_http_4xx_total{url=\"" << url << "\"} "
+            << s.http_4xx << "\n";
+
+        ss << "site_http_5xx_total{url=\"" << url << "\"} "
+            << s.http_5xx << "\n";
     }
 
     return ss.str();
