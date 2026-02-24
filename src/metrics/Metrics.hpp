@@ -12,4 +12,5 @@ public:
         const std::string& url);
 
     static std::string exportMetrics();
+    static int getHealth(const std::string& url);
 };

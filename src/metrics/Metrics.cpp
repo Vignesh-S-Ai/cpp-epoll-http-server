@@ -8,6 +8,8 @@
 #include <limits>
 #include <iostream>
 
+// ---------------- INTERNAL DATA STRUCTURE ----------------
+
 struct SiteStats {
     long total_latency = 0;
     int success_count = 0;
@@ -27,11 +29,14 @@ struct SiteStats {
 static std::mutex mtx;
 static std::unordered_map<std::string, SiteStats> stats_map;
 
+// ---------------- PERCENTILE CALCULATION ----------------
+
 static long computePercentile(
     const std::deque<long>& data,
     double percentile)
 {
-    if (data.empty()) return 0;
+    if (data.empty())
+        return 0;
 
     std::vector<long> sorted(data.begin(), data.end());
     std::sort(sorted.begin(), sorted.end());
@@ -45,7 +50,10 @@ static long computePercentile(
     return sorted[index];
 }
 
-static std::string healthToString(int h) {
+// ---------------- HEALTH STRING HELPER ----------------
+
+static std::string healthToString(int h)
+{
     switch (h) {
         case 0: return "DOWN";
         case 1: return "HEALTHY";
@@ -70,15 +78,30 @@ static int computeHealth(const SiteStats& s)
             total_checks;
     }
 
+    // DOWN logic unchanged
     if (s.consecutive_failures >= 3)
         return 0;  // DOWN
-    else if (p90 > 1000)
+
+    // If previously SLOW, require stronger recovery
+    if (s.last_health == 2) {
+        if (p90 < 900)
+            return 1;  // Back to HEALTHY
+        else
+            return 2;  // Stay SLOW
+    }
+
+    // Enter SLOW only if clearly slow
+    if (p90 > 1200)
         return 2;  // SLOW
-    else if (failure_rate > 0.3)
+
+    // DEGRADED logic
+    if (failure_rate > 0.3)
         return 3;  // DEGRADED
-    else
-        return 1;  // HEALTHY
+
+    return 1;  // HEALTHY
 }
+
+// ---------------- ALERT ON STATE CHANGE ----------------
 
 static void evaluateAndAlert(
     const std::string& url,
@@ -125,6 +148,7 @@ void Metrics::recordSuccess(
 
     s.latencies.push_back(latency);
 
+    // Keep rolling window size limited
     if (s.latencies.size() > 1000)
         s.latencies.pop_front();
 
@@ -213,4 +237,17 @@ std::string Metrics::exportMetrics()
     }
 
     return ss.str();
+}
+
+// ---------------- GET HEALTH (FOR ADAPTIVE SCHEDULER) ----------------
+
+int Metrics::getHealth(const std::string& url)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+
+    auto it = stats_map.find(url);
+    if (it == stats_map.end())
+        return 1; // Default HEALTHY
+
+    return computeHealth(it->second);
 }

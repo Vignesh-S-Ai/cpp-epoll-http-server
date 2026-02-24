@@ -2,7 +2,6 @@
 #include "../metrics/Metrics.hpp"
 #include "../http/HttpClient.hpp"
 #include "../external/json.hpp"
-
 #include <fstream>
 #include <iostream>
 
@@ -90,8 +89,19 @@ void MonitorManager::schedulerLoop()
                 }
 
                 // Interval check
+                int health = Metrics::getHealth(site.host);
+
+                int effective_interval = site.interval_sec;
+
+                if (health == 3 || health == 2) { 
+                    // DEGRADED or SLOW
+                    effective_interval = std::max(1, site.interval_sec / 2);
+                }
+
+                // DOWN handled by breaker logic already
+
                 if (now - site.last_checked <
-                    std::chrono::seconds(site.interval_sec))
+                    std::chrono::seconds(effective_interval))
                     continue;
 
                 auto response =
