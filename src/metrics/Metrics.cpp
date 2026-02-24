@@ -6,11 +6,15 @@
 #include <vector>
 #include <algorithm>
 #include <limits>
+#include <iostream>
 
 struct SiteStats {
     long total_latency = 0;
     int success_count = 0;
     int failure_count = 0;
+
+    int consecutive_failures = 0;
+    int last_health = -1;
 
     long min_latency = std::numeric_limits<long>::max();
     long max_latency = 0;
@@ -41,6 +45,63 @@ static long computePercentile(
     return sorted[index];
 }
 
+static std::string healthToString(int h) {
+    switch (h) {
+        case 0: return "DOWN";
+        case 1: return "HEALTHY";
+        case 2: return "SLOW";
+        case 3: return "DEGRADED";
+        default: return "UNKNOWN";
+    }
+}
+
+// ---------------- HEALTH ENGINE ----------------
+
+static int computeHealth(const SiteStats& s)
+{
+    long p90 = computePercentile(s.latencies, 0.90);
+
+    double failure_rate = 0.0;
+    int total_checks = s.success_count + s.failure_count;
+
+    if (total_checks > 0) {
+        failure_rate =
+            static_cast<double>(s.failure_count) /
+            total_checks;
+    }
+
+    if (s.consecutive_failures >= 3)
+        return 0;  // DOWN
+    else if (p90 > 1000)
+        return 2;  // SLOW
+    else if (failure_rate > 0.3)
+        return 3;  // DEGRADED
+    else
+        return 1;  // HEALTHY
+}
+
+static void evaluateAndAlert(
+    const std::string& url,
+    SiteStats& s)
+{
+    int new_health = computeHealth(s);
+
+    if (s.last_health != -1 &&
+        s.last_health != new_health)
+    {
+        std::cout << "[ALERT] "
+                  << url << " changed from "
+                  << healthToString(s.last_health)
+                  << " -> "
+                  << healthToString(new_health)
+                  << "\n";
+    }
+
+    s.last_health = new_health;
+}
+
+// ---------------- RECORD SUCCESS ----------------
+
 void Metrics::recordSuccess(
     const std::string& url,
     long latency,
@@ -54,6 +115,8 @@ void Metrics::recordSuccess(
     s.success_count++;
     s.total_bytes += bytes;
 
+    s.consecutive_failures = 0;
+
     if (latency < s.min_latency)
         s.min_latency = latency;
 
@@ -64,14 +127,26 @@ void Metrics::recordSuccess(
 
     if (s.latencies.size() > 1000)
         s.latencies.pop_front();
+
+    evaluateAndAlert(url, s);
 }
+
+// ---------------- RECORD FAILURE ----------------
 
 void Metrics::recordFailure(
     const std::string& url)
 {
     std::lock_guard<std::mutex> lock(mtx);
-    stats_map[url].failure_count++;
+
+    auto& s = stats_map[url];
+
+    s.failure_count++;
+    s.consecutive_failures++;
+
+    evaluateAndAlert(url, s);
 }
+
+// ---------------- EXPORT METRICS ----------------
 
 std::string Metrics::exportMetrics()
 {
@@ -91,6 +166,8 @@ std::string Metrics::exportMetrics()
         long p50 = computePercentile(s.latencies, 0.50);
         long p90 = computePercentile(s.latencies, 0.90);
         long p99 = computePercentile(s.latencies, 0.99);
+
+        int health = computeHealth(s);
 
         ss << "site_success{url=\""
            << url << "\"} "
@@ -129,6 +206,10 @@ std::string Metrics::exportMetrics()
         ss << "site_bytes_received_total{url=\""
            << url << "\"} "
            << s.total_bytes << "\n";
+
+        ss << "site_health{url=\""
+           << url << "\"} "
+           << health << "\n";
     }
 
     return ss.str();

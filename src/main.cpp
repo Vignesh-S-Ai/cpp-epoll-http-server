@@ -52,10 +52,9 @@ int main() {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    // Start Monitoring Engine
+    // Start Monitoring Engine (Config Driven)
     MonitorManager monitor;
-    monitor.addSite("google.com", 10);
-    monitor.addSite("nonexistent-xyz-12345.com", 10);
+    monitor.loadConfig("config.json");
     monitor.start();
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -88,10 +87,11 @@ int main() {
 
     while (running) {
 
-        int event_count = epoll_wait(epoll_fd,
-                                     events,
-                                     MAX_EVENTS,
-                                     1000);
+        int event_count =
+            epoll_wait(epoll_fd,
+                       events,
+                       MAX_EVENTS,
+                       1000);
 
         for (int i = 0; i < event_count; ++i) {
 
@@ -384,4 +384,4 @@ int main() {
 
     std::cout << "Server stopped.\n";
     return 0;
-    }
+}
