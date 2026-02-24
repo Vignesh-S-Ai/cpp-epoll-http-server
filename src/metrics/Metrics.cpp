@@ -1,4 +1,6 @@
 #include "Metrics.hpp"
+#include "../http/HttpClient.hpp"
+
 #include <unordered_map>
 #include <mutex>
 #include <sstream>
@@ -23,13 +25,19 @@ struct SiteStats {
 
     size_t total_bytes = 0;
 
+    // NEW: Failure classification counters
+    int dns_failures = 0;
+    int connection_errors = 0;
+    int timeouts = 0;
+    int receive_errors = 0;
+
     std::deque<long> latencies; // rolling window
 };
 
 static std::mutex mtx;
 static std::unordered_map<std::string, SiteStats> stats_map;
 
-// ---------------- PERCENTILE CALCULATION ----------------
+// ---------------- PERCENTILE ----------------
 
 static long computePercentile(
     const std::deque<long>& data,
@@ -50,7 +58,7 @@ static long computePercentile(
     return sorted[index];
 }
 
-// ---------------- HEALTH STRING HELPER ----------------
+// ---------------- HEALTH STRING ----------------
 
 static std::string healthToString(int h)
 {
@@ -63,7 +71,7 @@ static std::string healthToString(int h)
     }
 }
 
-// ---------------- HEALTH ENGINE ----------------
+// ---------------- HEALTH ENGINE (WITH HYSTERESIS) ----------------
 
 static int computeHealth(const SiteStats& s)
 {
@@ -78,30 +86,26 @@ static int computeHealth(const SiteStats& s)
             total_checks;
     }
 
-    // DOWN logic unchanged
     if (s.consecutive_failures >= 3)
         return 0;  // DOWN
 
-    // If previously SLOW, require stronger recovery
     if (s.last_health == 2) {
         if (p90 < 900)
-            return 1;  // Back to HEALTHY
+            return 1;
         else
-            return 2;  // Stay SLOW
+            return 2;
     }
 
-    // Enter SLOW only if clearly slow
     if (p90 > 1200)
-        return 2;  // SLOW
+        return 2;
 
-    // DEGRADED logic
     if (failure_rate > 0.3)
-        return 3;  // DEGRADED
+        return 3;
 
-    return 1;  // HEALTHY
+    return 1;
 }
 
-// ---------------- ALERT ON STATE CHANGE ----------------
+// ---------------- ALERT ENGINE ----------------
 
 static void evaluateAndAlert(
     const std::string& url,
@@ -148,14 +152,13 @@ void Metrics::recordSuccess(
 
     s.latencies.push_back(latency);
 
-    // Keep rolling window size limited
     if (s.latencies.size() > 1000)
         s.latencies.pop_front();
 
     evaluateAndAlert(url, s);
 }
 
-// ---------------- RECORD FAILURE ----------------
+// ---------------- RECORD FAILURE (GENERIC) ----------------
 
 void Metrics::recordFailure(
     const std::string& url)
@@ -166,6 +169,43 @@ void Metrics::recordFailure(
 
     s.failure_count++;
     s.consecutive_failures++;
+
+    evaluateAndAlert(url, s);
+}
+
+// ---------------- RECORD FAILURE TYPE (NEW) ----------------
+
+void Metrics::recordFailureType(
+    const std::string& url,
+    HttpClient::CheckResult result)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+
+    auto& s = stats_map[url];
+
+    s.failure_count++;
+    s.consecutive_failures++;
+
+    switch (result) {
+        case HttpClient::CheckResult::DNS_ERROR:
+            s.dns_failures++;
+            break;
+
+        case HttpClient::CheckResult::CONNECTION_ERROR:
+            s.connection_errors++;
+            break;
+
+        case HttpClient::CheckResult::TIMEOUT:
+            s.timeouts++;
+            break;
+
+        case HttpClient::CheckResult::RECEIVE_ERROR:
+            s.receive_errors++;
+            break;
+
+        default:
+            break;
+    }
 
     evaluateAndAlert(url, s);
 }
@@ -193,53 +233,55 @@ std::string Metrics::exportMetrics()
 
         int health = computeHealth(s);
 
-        ss << "site_success{url=\""
-           << url << "\"} "
+        ss << "site_success{url=\"" << url << "\"} "
            << s.success_count << "\n";
 
-        ss << "site_failure{url=\""
-           << url << "\"} "
+        ss << "site_failure{url=\"" << url << "\"} "
            << s.failure_count << "\n";
 
-        ss << "site_avg_latency_ms{url=\""
-           << url << "\"} "
+        ss << "site_dns_failures_total{url=\"" << url << "\"} "
+           << s.dns_failures << "\n";
+
+        ss << "site_connection_errors_total{url=\"" << url << "\"} "
+           << s.connection_errors << "\n";
+
+        ss << "site_timeouts_total{url=\"" << url << "\"} "
+           << s.timeouts << "\n";
+
+        ss << "site_receive_errors_total{url=\"" << url << "\"} "
+           << s.receive_errors << "\n";
+
+        ss << "site_avg_latency_ms{url=\"" << url << "\"} "
            << avg_latency << "\n";
 
-        ss << "site_latency_ms{url=\""
-           << url << "\",quantile=\"0.50\"} "
-           << p50 << "\n";
+        ss << "site_latency_ms{url=\"" << url
+           << "\",quantile=\"0.50\"} " << p50 << "\n";
 
-        ss << "site_latency_ms{url=\""
-           << url << "\",quantile=\"0.90\"} "
-           << p90 << "\n";
+        ss << "site_latency_ms{url=\"" << url
+           << "\",quantile=\"0.90\"} " << p90 << "\n";
 
-        ss << "site_latency_ms{url=\""
-           << url << "\",quantile=\"0.99\"} "
-           << p99 << "\n";
+        ss << "site_latency_ms{url=\"" << url
+           << "\",quantile=\"0.99\"} " << p99 << "\n";
 
-        ss << "site_min_latency_ms{url=\""
-           << url << "\"} "
+        ss << "site_min_latency_ms{url=\"" << url << "\"} "
            << (s.min_latency ==
                std::numeric_limits<long>::max()
                ? 0 : s.min_latency) << "\n";
 
-        ss << "site_max_latency_ms{url=\""
-           << url << "\"} "
+        ss << "site_max_latency_ms{url=\"" << url << "\"} "
            << s.max_latency << "\n";
 
-        ss << "site_bytes_received_total{url=\""
-           << url << "\"} "
+        ss << "site_bytes_received_total{url=\"" << url << "\"} "
            << s.total_bytes << "\n";
 
-        ss << "site_health{url=\""
-           << url << "\"} "
+        ss << "site_health{url=\"" << url << "\"} "
            << health << "\n";
     }
 
     return ss.str();
 }
 
-// ---------------- GET HEALTH (FOR ADAPTIVE SCHEDULER) ----------------
+// ---------------- GET HEALTH ----------------
 
 int Metrics::getHealth(const std::string& url)
 {
@@ -247,7 +289,7 @@ int Metrics::getHealth(const std::string& url)
 
     auto it = stats_map.find(url);
     if (it == stats_map.end())
-        return 1; // Default HEALTHY
+        return 1;
 
     return computeHealth(it->second);
 }

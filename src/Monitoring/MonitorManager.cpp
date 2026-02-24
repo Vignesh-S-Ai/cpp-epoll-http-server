@@ -134,37 +134,40 @@ void MonitorManager::schedulerLoop()
                         site.cooldown_seconds = 10;
                     }
                 }
+
                 else {
 
-                    Metrics::recordFailure(site.host);
+                        // Record categorized failure
+                        Metrics::recordFailureType(
+                            site.host,
+                            response.result);
 
-                    site.local_consecutive_failures++;
+                        site.local_consecutive_failures++;
 
-                    // Only open breaker after 3 consecutive failures
-                    if (site.local_consecutive_failures >= 3) {
+                        // Only open breaker after 3 consecutive failures
+                        if (site.local_consecutive_failures >= 3) {
 
-                        site.breaker =
-                            Site::BreakerState::OPEN;
+                            site.breaker =
+                                Site::BreakerState::OPEN;
 
-                        site.breaker_open_time = now;
+                            site.breaker_open_time = now;
 
-                        site.open_attempts++;
+                            site.open_attempts++;
 
-                        site.cooldown_seconds =
-                            std::min(300,
-                                     10 * (1 << site.open_attempts));
+                            site.cooldown_seconds =
+                                std::min(300,
+                                        10 * (1 << site.open_attempts));
 
-                        std::cout << "[BREAKER] "
-                                  << site.host
-                                  << " entering OPEN state "
-                                  << "(cooldown "
-                                  << site.cooldown_seconds
-                                  << "s)\n";
+                            std::cout << "[BREAKER] "
+                                    << site.host
+                                    << " entering OPEN state "
+                                    << "(cooldown "
+                                    << site.cooldown_seconds
+                                    << "s)\n";
 
-                        site.local_consecutive_failures = 0;
-                    }
+                            site.local_consecutive_failures = 0;
+                        }
                 }
-
                 site.last_checked = now;
             }
         }

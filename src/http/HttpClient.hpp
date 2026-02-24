@@ -6,7 +6,6 @@
 class HttpClient {
 public:
 
-    // Detailed result classification
     enum class CheckResult {
         SUCCESS,
         DNS_ERROR,
@@ -27,7 +26,6 @@ public:
             : result(r), latency_ms(l), bytes_received(b) {}
     };
 
-    // Main check function
     static Response checkWebsite(
         const std::string& host,
         int timeout_seconds = 5
