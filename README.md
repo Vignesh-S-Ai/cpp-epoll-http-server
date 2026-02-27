@@ -1,19 +1,22 @@
-# Production HTTP Server (C++)
+# 🚀 ProductionHTTPServer
 
-## Features
-- Multithreaded ThreadPool
-- Graceful shutdown (SIGINT/SIGTERM)
-- Structured logging
-- Basic HTTP response handling
-- Concurrent request processing
+High-performance C++ HTTP server built using Linux EPOLL with adaptive scheduling, circuit breaker pattern, real-time metrics monitoring, and Docker support.
 
-## Build
+Designed to simulate production-grade backend system architecture.
 
-g++ src/main.cpp \
-    src/threadpool/ThreadPool.cpp \
-    src/utils/Logger.cpp \
-    -o server -pthread
+---
 
-## Run
+## 🧠 Architecture Overview
 
-./server
+
+## 🧠 System Flow
+
+```mermaid
+flowchart TD
+    A[Client] --> B[Non-blocking EPOLL Loop]
+    B --> C[Worker Thread Pool]
+    C --> D[Load-Aware Scheduler]
+    D --> E[Circuit Breaker State Machine]
+    E --> F[HTTP Processing Layer]
+    F --> G[Metrics Collector]
+    F --> H[Structured Logger]
