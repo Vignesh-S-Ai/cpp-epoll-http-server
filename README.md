@@ -11,12 +11,39 @@ Designed to simulate production-grade backend system architecture.
 
 ## 🧠 System Flow
 
-```mermaid
-flowchart TD
-    A[Client] --> B[Non-blocking EPOLL Loop]
-    B --> C[Worker Thread Pool]
-    C --> D[Load-Aware Scheduler]
-    D --> E[Circuit Breaker State Machine]
-    E --> F[HTTP Processing Layer]
-    F --> G[Metrics Collector]
-    F --> H[Structured Logger]
+
+```
+                +-------------------+
+                |      Client       |
+                +-------------------+
+                          |
+                          v
+                +-------------------+
+                |  EPOLL Event Loop |
+                +-------------------+
+                          |
+                          v
+                +-------------------+
+                |    Thread Pool    |
+                +-------------------+
+                          |
+                          v
+                +-------------------+
+                | Adaptive Scheduler|
+                +-------------------+
+                          |
+                          v
+                +-------------------+
+                |  Circuit Breaker  |
+                +-------------------+
+                          |
+                          v
+                +-------------------+
+                |   HTTP Handler    |
+                +-------------------+
+                          |
+                          v
+                +-------------------+
+                | Metrics + Logging |
+                +-------------------+
+```
