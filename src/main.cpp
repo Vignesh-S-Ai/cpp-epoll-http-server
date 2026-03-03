@@ -5,13 +5,14 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <unordered_map>
 #include <sstream>
 #include <chrono>
+#include <errno.h>
 
 #include "metrics/Metrics.hpp"
 #include "Monitoring/MonitorManager.hpp"
 #include "core/Reactor.hpp"
+#include "server/ConnectionManager.hpp"
 
 constexpr int PORT = 8080;
 constexpr int BUFFER_SIZE = 4096;
@@ -21,20 +22,9 @@ constexpr int MAX_REQUEST_SIZE = 8192;
 
 std::atomic<bool> running(true);
 std::atomic<long> total_requests(0);
-std::atomic<long> active_connections(0);
 
 int server_fd = -1;
 Reactor* global_reactor = nullptr;
-
-struct Connection {
-    int fd;
-    std::string read_buffer;
-    std::string write_buffer;
-    bool keep_alive = true;
-    std::chrono::steady_clock::time_point last_active;
-};
-
-std::unordered_map<int, Connection> connections;
 
 void set_non_blocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -53,7 +43,6 @@ int main() {
 
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
-    
 
     MonitorManager monitor;
     monitor.loadConfig("config.json");
@@ -82,39 +71,23 @@ int main() {
     std::cout << "Monitoring EPOLLET Server running on port "
               << PORT << "\n";
 
+    ConnectionManager connManager;
+
     reactor.run([&](int fd, uint32_t events) {
 
         if (!running) return;
+
+        // HEARTBEAT (Idle Sweep)
         if (fd == -1) {
-
-            auto now = std::chrono::steady_clock::now();
-
-            for (auto it = connections.begin();
-                it != connections.end();) {
-
-                auto duration =
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        now - it->second.last_active).count();
-
-                if (duration > IDLE_TIMEOUT_SEC) {
-
-                    close(it->first);
-                    reactor.removeFd(it->first);
-                    it = connections.erase(it);
-                    active_connections--;
-
-                } else {
-                    ++it;
-                }
-            }
-
+            connManager.sweepIdle(IDLE_TIMEOUT_SEC);
             return;
         }
 
-        // ACCEPT CLIENTS
+        // ACCEPT
         if (fd == server_fd) {
 
             while (true) {
+
                 sockaddr_in client{};
                 socklen_t len = sizeof(client);
 
@@ -128,7 +101,7 @@ int main() {
                     break;
                 }
 
-                if (active_connections >= MAX_CONNECTIONS) {
+                if (connManager.activeCount() >= MAX_CONNECTIONS) {
 
                     const char* body = "Service Unavailable";
 
@@ -146,24 +119,17 @@ int main() {
 
                 set_non_blocking(client_fd);
                 reactor.addFd(client_fd, EPOLLIN | EPOLLET);
-
-                connections[client_fd] = Connection{
-                    client_fd,
-                    "",
-                    "",
-                    true,
-                    std::chrono::steady_clock::now()
-                };
-
-                active_connections++;
+                connManager.add(client_fd);
             }
         }
 
-        // READABLE
+        // READ
         else if (events & EPOLLIN) {
 
+            if (!connManager.exists(fd)) return;
+
             char buffer[BUFFER_SIZE];
-            auto &conn = connections[fd];
+            auto &conn = connManager.get(fd);
 
             while (true) {
 
@@ -173,27 +139,22 @@ int main() {
                     if (bytes == -1 && errno == EAGAIN)
                         break;
 
-                    close(fd);
                     reactor.removeFd(fd);
-                    connections.erase(fd);
-                    active_connections--;
+                    connManager.remove(fd);
                     return;
                 }
 
                 conn.read_buffer.append(buffer, bytes);
-                conn.last_active = std::chrono::steady_clock::now();
+                connManager.updateActivity(fd);
 
                 if (conn.read_buffer.size() > MAX_REQUEST_SIZE) {
-                    close(fd);
                     reactor.removeFd(fd);
-                    connections.erase(fd);
-                    active_connections--;
+                    connManager.remove(fd);
                     return;
                 }
             }
 
-            size_t header_end =
-                conn.read_buffer.find("\r\n\r\n");
+            size_t header_end = conn.read_buffer.find("\r\n\r\n");
 
             if (header_end != std::string::npos) {
 
@@ -220,7 +181,7 @@ int main() {
                         std::to_string(total_requests.load()) +
                         ",\n"
                         "  \"active_connections\": " +
-                        std::to_string(active_connections.load()) +
+                        std::to_string(connManager.activeCount()) +
                         "\n}";
 
                     response =
@@ -230,7 +191,6 @@ int main() {
                 } else if (path == "/metrics") {
 
                     body = Metrics::exportMetrics();
-
                     response =
                         "HTTP/1.1 200 OK\r\n"
                         "Content-Type: text/plain\r\n";
@@ -238,7 +198,6 @@ int main() {
                 } else {
 
                     body = "Monitoring EPOLLET Server";
-
                     response =
                         "HTTP/1.1 200 OK\r\n"
                         "Content-Type: text/plain\r\n";
@@ -249,10 +208,9 @@ int main() {
                     std::to_string(body.size()) +
                     "\r\n";
 
-                if (conn.keep_alive)
-                    response += "Connection: keep-alive\r\n\r\n";
-                else
-                    response += "Connection: close\r\n\r\n";
+                response += conn.keep_alive
+                            ? "Connection: keep-alive\r\n\r\n"
+                            : "Connection: close\r\n\r\n";
 
                 response += body;
 
@@ -263,10 +221,12 @@ int main() {
             }
         }
 
-        // WRITABLE
+        // WRITE
         else if (events & EPOLLOUT) {
 
-            auto &conn = connections[fd];
+            if (!connManager.exists(fd)) return;
+
+            auto &conn = connManager.get(fd);
 
             while (!conn.write_buffer.empty()) {
 
@@ -280,10 +240,8 @@ int main() {
                     if (sent == -1 && errno == EAGAIN)
                         break;
 
-                    close(fd);
                     reactor.removeFd(fd);
-                    connections.erase(fd);
-                    active_connections--;
+                    connManager.remove(fd);
                     return;
                 }
 
@@ -292,36 +250,12 @@ int main() {
 
             if (conn.write_buffer.empty()) {
 
-                if (conn.keep_alive) {
+                if (conn.keep_alive)
                     reactor.modifyFd(fd, EPOLLIN | EPOLLET);
-                } else {
-                    close(fd);
+                else {
                     reactor.removeFd(fd);
-                    connections.erase(fd);
-                    active_connections--;
+                    connManager.remove(fd);
                 }
-            }
-        }
-
-        // IDLE SWEEP
-        auto now = std::chrono::steady_clock::now();
-
-        for (auto it = connections.begin();
-             it != connections.end();) {
-
-            auto duration =
-                std::chrono::duration_cast<std::chrono::seconds>(
-                    now - it->second.last_active).count();
-
-            if (duration > IDLE_TIMEOUT_SEC) {
-
-                close(it->first);
-                reactor.removeFd(it->first);
-                it = connections.erase(it);
-                active_connections--;
-
-            } else {
-                ++it;
             }
         }
 
