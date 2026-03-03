@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sstream>
 #include <chrono>
 #include <errno.h>
@@ -13,12 +14,14 @@
 #include "Monitoring/MonitorManager.hpp"
 #include "core/Reactor.hpp"
 #include "server/ConnectionManager.hpp"
+#include "ip_tracking/IPTracker.hpp"
 
 constexpr int PORT = 8080;
 constexpr int BUFFER_SIZE = 4096;
 constexpr int IDLE_TIMEOUT_SEC = 10;
 constexpr int MAX_CONNECTIONS = 1000;
 constexpr int MAX_REQUEST_SIZE = 8192;
+constexpr int MAX_REQUESTS_PER_SEC = 500;
 
 std::atomic<bool> running(true);
 std::atomic<long> total_requests(0);
@@ -72,12 +75,13 @@ int main() {
               << PORT << "\n";
 
     ConnectionManager connManager;
+    IPTracker ipTracker;
 
     reactor.run([&](int fd, uint32_t events) {
 
         if (!running) return;
 
-        // HEARTBEAT (Idle Sweep)
+        // HEARTBEAT
         if (fd == -1) {
             connManager.sweepIdle(IDLE_TIMEOUT_SEC);
             return;
@@ -117,9 +121,14 @@ int main() {
                     continue;
                 }
 
+                char ip_buffer[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &client.sin_addr,
+                          ip_buffer, INET_ADDRSTRLEN);
+                std::string client_ip(ip_buffer);
+
                 set_non_blocking(client_fd);
                 reactor.addFd(client_fd, EPOLLIN | EPOLLET);
-                connManager.add(client_fd);
+                connManager.add(client_fd, client_ip);
             }
         }
 
@@ -147,6 +156,17 @@ int main() {
                 conn.read_buffer.append(buffer, bytes);
                 connManager.updateActivity(fd);
 
+                // IP RATE TRACKING
+                ipTracker.recordRequest(conn.client_ip);
+
+                if (ipTracker.getCurrentRate(conn.client_ip)
+                    > MAX_REQUESTS_PER_SEC) {
+
+                    reactor.removeFd(fd);
+                    connManager.remove(fd);
+                    return;
+                }
+
                 if (conn.read_buffer.size() > MAX_REQUEST_SIZE) {
                     reactor.removeFd(fd);
                     connManager.remove(fd);
@@ -154,7 +174,8 @@ int main() {
                 }
             }
 
-            size_t header_end = conn.read_buffer.find("\r\n\r\n");
+            size_t header_end =
+                conn.read_buffer.find("\r\n\r\n");
 
             if (header_end != std::string::npos) {
 
@@ -168,7 +189,8 @@ int main() {
                 stream >> method >> path >> version;
 
                 conn.keep_alive =
-                    request.find("Connection: close") == std::string::npos;
+                    request.find("Connection: close")
+                    == std::string::npos;
 
                 std::string body;
                 std::string response;
