@@ -197,7 +197,7 @@ void Metrics::recordFailureType(
     std::lock_guard<std::mutex> lock(mtx);
 
     auto& s = stats_map[url];
-
+    
     s.failure_count++;
     s.consecutive_failures++;
 
