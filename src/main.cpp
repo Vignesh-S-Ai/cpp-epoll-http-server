@@ -5,17 +5,15 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <sys/epoll.h>
 #include <unordered_map>
 #include <sstream>
 #include <chrono>
-#include "metrics/Metrics.hpp"
 
-#include "Monitoring/MonitorManager.hpp"
 #include "metrics/Metrics.hpp"
+#include "Monitoring/MonitorManager.hpp"
+#include "core/Reactor.hpp"
 
 constexpr int PORT = 8080;
-constexpr int MAX_EVENTS = 1024;
 constexpr int BUFFER_SIZE = 4096;
 constexpr int IDLE_TIMEOUT_SEC = 10;
 constexpr int MAX_CONNECTIONS = 1000;
@@ -26,6 +24,7 @@ std::atomic<long> total_requests(0);
 std::atomic<long> active_connections(0);
 
 int server_fd = -1;
+Reactor* global_reactor = nullptr;
 
 struct Connection {
     int fd;
@@ -44,15 +43,18 @@ void set_non_blocking(int fd) {
 
 void signal_handler(int) {
     running = false;
-    if (server_fd != -1) close(server_fd);
+    if (global_reactor)
+        global_reactor->stop();
+    if (server_fd != -1)
+        close(server_fd);
 }
 
 int main() {
 
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+    
 
-    // Start Monitoring Engine (Config Driven)
     MonitorManager monitor;
     monitor.loadConfig("config.json");
     monitor.start();
@@ -72,304 +74,249 @@ int main() {
 
     set_non_blocking(server_fd);
 
-    int epoll_fd = epoll_create1(0);
+    Reactor reactor;
+    global_reactor = &reactor;
 
-    epoll_event event{};
-    event.events = EPOLLIN | EPOLLET;
-    event.data.fd = server_fd;
-
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event);
-
-    epoll_event events[MAX_EVENTS];
+    reactor.addFd(server_fd, EPOLLIN | EPOLLET);
 
     std::cout << "Monitoring EPOLLET Server running on port "
               << PORT << "\n";
 
-    while (running) {
+    reactor.run([&](int fd, uint32_t events) {
 
-        int event_count =
-            epoll_wait(epoll_fd,
-                       events,
-                       MAX_EVENTS,
-                       1000);
+        if (!running) return;
+        if (fd == -1) {
 
-        for (int i = 0; i < event_count; ++i) {
+            auto now = std::chrono::steady_clock::now();
 
-            int fd = events[i].data.fd;
+            for (auto it = connections.begin();
+                it != connections.end();) {
 
-            // ACCEPT CLIENTS
-            if (fd == server_fd) {
+                auto duration =
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        now - it->second.last_active).count();
 
-                while (true) {
+                if (duration > IDLE_TIMEOUT_SEC) {
 
-                    sockaddr_in client{};
-                    socklen_t len = sizeof(client);
+                    close(it->first);
+                    reactor.removeFd(it->first);
+                    it = connections.erase(it);
+                    active_connections--;
 
-                    int client_fd = accept(server_fd,
-                                           (struct sockaddr*)&client,
-                                           &len);
-
-                    if (client_fd == -1) {
-                        if (errno == EAGAIN ||
-                            errno == EWOULDBLOCK)
-                            break;
-                        break;
-                    }
-
-                    if (active_connections >= MAX_CONNECTIONS) {
-
-                        const char* body =
-                            "Service Unavailable";
-
-                        std::string resp =
-                            "HTTP/1.1 503 Service Unavailable\r\n"
-                            "Content-Length: " +
-                            std::to_string(strlen(body)) +
-                            "\r\nConnection: close\r\n\r\n" +
-                            std::string(body);
-
-                        send(client_fd,
-                             resp.c_str(),
-                             resp.size(), 0);
-
-                        close(client_fd);
-                        continue;
-                    }
-
-                    set_non_blocking(client_fd);
-
-                    epoll_event ev{};
-                    ev.events = EPOLLIN | EPOLLET;
-                    ev.data.fd = client_fd;
-
-                    epoll_ctl(epoll_fd,
-                              EPOLL_CTL_ADD,
-                              client_fd,
-                              &ev);
-
-                    connections[client_fd] =
-                        Connection{
-                            client_fd,
-                            "",
-                            "",
-                            true,
-                            std::chrono::steady_clock::now()
-                        };
-
-                    active_connections++;
+                } else {
+                    ++it;
                 }
             }
 
-            // READABLE
-            else if (events[i].events & EPOLLIN) {
+            return;
+        }
 
-                char buffer[BUFFER_SIZE];
+        // ACCEPT CLIENTS
+        if (fd == server_fd) {
 
-                while (true) {
+            while (true) {
+                sockaddr_in client{};
+                socklen_t len = sizeof(client);
 
-                    ssize_t bytes =
-                        recv(fd, buffer,
-                             sizeof(buffer), 0);
+                int client_fd = accept(server_fd,
+                                       (struct sockaddr*)&client,
+                                       &len);
 
-                    if (bytes <= 0) {
-                        if (bytes == -1 && errno == EAGAIN)
-                            break;
-
-                        close(fd);
-                        epoll_ctl(epoll_fd,
-                                  EPOLL_CTL_DEL,
-                                  fd,
-                                  nullptr);
-                        connections.erase(fd);
-                        active_connections--;
+                if (client_fd == -1) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK)
                         break;
-                    }
-
-                    auto &conn = connections[fd];
-
-                    conn.read_buffer.append(buffer, bytes);
-                    conn.last_active =
-                        std::chrono::steady_clock::now();
-
-                    if (conn.read_buffer.size() >
-                        MAX_REQUEST_SIZE) {
-
-                        close(fd);
-                        epoll_ctl(epoll_fd,
-                                  EPOLL_CTL_DEL,
-                                  fd,
-                                  nullptr);
-                        connections.erase(fd);
-                        active_connections--;
-                        break;
-                    }
+                    break;
                 }
 
-                auto &conn = connections[fd];
+                if (active_connections >= MAX_CONNECTIONS) {
 
-                size_t header_end =
-                    conn.read_buffer.find("\r\n\r\n");
+                    const char* body = "Service Unavailable";
 
-                if (header_end != std::string::npos) {
-
-                    total_requests++;
-
-                    std::string request =
-                        conn.read_buffer.substr(
-                            0, header_end + 4);
-
-                    std::istringstream stream(request);
-                    std::string method, path, version;
-                    stream >> method >> path >> version;
-
-                    conn.keep_alive =
-                        request.find("Connection: close")
-                        == std::string::npos;
-
-                    std::string body;
-                    std::string response;
-
-                    if (path == "/stats") {
-
-                        body =
-                            "{\n"
-                            "  \"total_requests\": " +
-                            std::to_string(total_requests.load()) +
-                            ",\n"
-                            "  \"active_connections\": " +
-                            std::to_string(active_connections.load()) +
-                            "\n}";
-
-                        response =
-                            "HTTP/1.1 200 OK\r\n"
-                            "Content-Type: application/json\r\n";
-
-                    }
-                    else if (path == "/metrics") {
-
-                        body = Metrics::exportMetrics();
-
-                        response =
-                            "HTTP/1.1 200 OK\r\n"
-                            "Content-Type: text/plain\r\n";
-
-                    }
-                    else {
-
-                        body = "Monitoring EPOLLET Server";
-
-                        response =
-                            "HTTP/1.1 200 OK\r\n"
-                            "Content-Type: text/plain\r\n";
-                    }
-
-                    response +=
+                    std::string resp =
+                        "HTTP/1.1 503 Service Unavailable\r\n"
                         "Content-Length: " +
-                        std::to_string(body.size()) +
-                        "\r\n";
+                        std::to_string(strlen(body)) +
+                        "\r\nConnection: close\r\n\r\n" +
+                        std::string(body);
 
-                    if (conn.keep_alive)
-                        response +=
-                            "Connection: keep-alive\r\n\r\n";
-                    else
-                        response +=
-                            "Connection: close\r\n\r\n";
+                    send(client_fd, resp.c_str(), resp.size(), 0);
+                    close(client_fd);
+                    continue;
+                }
 
-                    response += body;
+                set_non_blocking(client_fd);
+                reactor.addFd(client_fd, EPOLLIN | EPOLLET);
 
-                    conn.write_buffer = response;
-                    conn.read_buffer.clear();
+                connections[client_fd] = Connection{
+                    client_fd,
+                    "",
+                    "",
+                    true,
+                    std::chrono::steady_clock::now()
+                };
 
-                    epoll_event ev{};
-                    ev.events = EPOLLOUT | EPOLLET;
-                    ev.data.fd = fd;
+                active_connections++;
+            }
+        }
 
-                    epoll_ctl(epoll_fd,
-                              EPOLL_CTL_MOD,
-                              fd,
-                              &ev);
+        // READABLE
+        else if (events & EPOLLIN) {
+
+            char buffer[BUFFER_SIZE];
+            auto &conn = connections[fd];
+
+            while (true) {
+
+                ssize_t bytes = recv(fd, buffer, sizeof(buffer), 0);
+
+                if (bytes <= 0) {
+                    if (bytes == -1 && errno == EAGAIN)
+                        break;
+
+                    close(fd);
+                    reactor.removeFd(fd);
+                    connections.erase(fd);
+                    active_connections--;
+                    return;
+                }
+
+                conn.read_buffer.append(buffer, bytes);
+                conn.last_active = std::chrono::steady_clock::now();
+
+                if (conn.read_buffer.size() > MAX_REQUEST_SIZE) {
+                    close(fd);
+                    reactor.removeFd(fd);
+                    connections.erase(fd);
+                    active_connections--;
+                    return;
                 }
             }
 
-            // WRITABLE
-            else if (events[i].events & EPOLLOUT) {
+            size_t header_end =
+                conn.read_buffer.find("\r\n\r\n");
 
-                auto &conn = connections[fd];
+            if (header_end != std::string::npos) {
 
-                while (!conn.write_buffer.empty()) {
+                total_requests++;
 
-                    ssize_t sent =
-                        send(fd,
-                             conn.write_buffer.c_str(),
-                             conn.write_buffer.size(),
-                             0);
+                std::string request =
+                    conn.read_buffer.substr(0, header_end + 4);
 
-                    if (sent <= 0) {
-                        if (sent == -1 && errno == EAGAIN)
-                            break;
+                std::istringstream stream(request);
+                std::string method, path, version;
+                stream >> method >> path >> version;
 
-                        close(fd);
-                        epoll_ctl(epoll_fd,
-                                  EPOLL_CTL_DEL,
-                                  fd,
-                                  nullptr);
-                        connections.erase(fd);
-                        active_connections--;
-                        break;
-                    }
+                conn.keep_alive =
+                    request.find("Connection: close") == std::string::npos;
 
-                    conn.write_buffer.erase(0, sent);
+                std::string body;
+                std::string response;
+
+                if (path == "/stats") {
+
+                    body =
+                        "{\n"
+                        "  \"total_requests\": " +
+                        std::to_string(total_requests.load()) +
+                        ",\n"
+                        "  \"active_connections\": " +
+                        std::to_string(active_connections.load()) +
+                        "\n}";
+
+                    response =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n";
+
+                } else if (path == "/metrics") {
+
+                    body = Metrics::exportMetrics();
+
+                    response =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/plain\r\n";
+
+                } else {
+
+                    body = "Monitoring EPOLLET Server";
+
+                    response =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/plain\r\n";
                 }
 
-                if (conn.write_buffer.empty()) {
+                response +=
+                    "Content-Length: " +
+                    std::to_string(body.size()) +
+                    "\r\n";
 
-                    if (conn.keep_alive) {
+                if (conn.keep_alive)
+                    response += "Connection: keep-alive\r\n\r\n";
+                else
+                    response += "Connection: close\r\n\r\n";
 
-                        epoll_event ev{};
-                        ev.events =
-                            EPOLLIN | EPOLLET;
-                        ev.data.fd = fd;
+                response += body;
 
-                        epoll_ctl(epoll_fd,
-                                  EPOLL_CTL_MOD,
-                                  fd,
-                                  &ev);
+                conn.write_buffer = response;
+                conn.read_buffer.clear();
 
-                    } else {
+                reactor.modifyFd(fd, EPOLLOUT | EPOLLET);
+            }
+        }
 
-                        close(fd);
-                        epoll_ctl(epoll_fd,
-                                  EPOLL_CTL_DEL,
-                                  fd,
-                                  nullptr);
-                        connections.erase(fd);
-                        active_connections--;
-                    }
+        // WRITABLE
+        else if (events & EPOLLOUT) {
+
+            auto &conn = connections[fd];
+
+            while (!conn.write_buffer.empty()) {
+
+                ssize_t sent =
+                    send(fd,
+                         conn.write_buffer.c_str(),
+                         conn.write_buffer.size(),
+                         0);
+
+                if (sent <= 0) {
+                    if (sent == -1 && errno == EAGAIN)
+                        break;
+
+                    close(fd);
+                    reactor.removeFd(fd);
+                    connections.erase(fd);
+                    active_connections--;
+                    return;
+                }
+
+                conn.write_buffer.erase(0, sent);
+            }
+
+            if (conn.write_buffer.empty()) {
+
+                if (conn.keep_alive) {
+                    reactor.modifyFd(fd, EPOLLIN | EPOLLET);
+                } else {
+                    close(fd);
+                    reactor.removeFd(fd);
+                    connections.erase(fd);
+                    active_connections--;
                 }
             }
         }
 
         // IDLE SWEEP
-        auto now =
-            std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
 
         for (auto it = connections.begin();
              it != connections.end();) {
 
             auto duration =
-                std::chrono::duration_cast<
-                    std::chrono::seconds>(
-                    now - it->second.last_active)
-                    .count();
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    now - it->second.last_active).count();
 
             if (duration > IDLE_TIMEOUT_SEC) {
 
                 close(it->first);
-                epoll_ctl(epoll_fd,
-                          EPOLL_CTL_DEL,
-                          it->first,
-                          nullptr);
-
+                reactor.removeFd(it->first);
                 it = connections.erase(it);
                 active_connections--;
 
@@ -377,11 +324,10 @@ int main() {
                 ++it;
             }
         }
-    }
+
+    });
 
     monitor.stop();
-    close(epoll_fd);
-
     std::cout << "Server stopped.\n";
     return 0;
 }
