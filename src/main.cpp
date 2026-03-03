@@ -21,7 +21,7 @@ constexpr int BUFFER_SIZE = 4096;
 constexpr int IDLE_TIMEOUT_SEC = 10;
 constexpr int MAX_CONNECTIONS = 1000;
 constexpr int MAX_REQUEST_SIZE = 8192;
-constexpr int MAX_REQUESTS_PER_SEC = 500;
+constexpr int MAX_REQUESTS_PER_SEC = 2000;
 
 std::atomic<bool> running(true);
 std::atomic<long> total_requests(0);
@@ -188,9 +188,7 @@ int main() {
                 std::string method, path, version;
                 stream >> method >> path >> version;
 
-                conn.keep_alive =
-                    request.find("Connection: close")
-                    == std::string::npos;
+                conn.keep_alive =false;
 
                 std::string body;
                 std::string response;
