@@ -15,4 +15,4 @@ public:
 private:
     std::atomic<uint64_t> total_requests{0};
     std::atomic<uint64_t> active_connections{0};
-};
+};  
