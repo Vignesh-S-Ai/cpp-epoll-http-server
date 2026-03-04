@@ -15,13 +15,15 @@
 #include "core/Reactor.hpp"
 #include "server/ConnectionManager.hpp"
 #include "ip_tracking/IPTracker.hpp"
+#include "security/IPBlacklist.hpp"
+#include "security/ThreatDetector.hpp"
 
 constexpr int PORT = 8080;
 constexpr int BUFFER_SIZE = 4096;
 constexpr int IDLE_TIMEOUT_SEC = 10;
 constexpr int MAX_CONNECTIONS = 1000;
 constexpr int MAX_REQUEST_SIZE = 8192;
-constexpr int MAX_REQUESTS_PER_SEC = 2000;
+constexpr int MAX_REQUESTS_PER_SEC = 50;
 
 std::atomic<bool> running(true);
 std::atomic<long> total_requests(0);
@@ -38,6 +40,7 @@ void signal_handler(int) {
     running = false;
     if (global_reactor)
         global_reactor->stop();
+
     if (server_fd != -1)
         close(server_fd);
 }
@@ -76,6 +79,8 @@ int main() {
 
     ConnectionManager connManager;
     IPTracker ipTracker;
+    ThreatDetector detector;
+    IPBlacklist blacklist;
 
     reactor.run([&](int fd, uint32_t events) {
 
@@ -87,7 +92,7 @@ int main() {
             return;
         }
 
-        // ACCEPT
+        // ACCEPT NEW CONNECTIONS
         if (fd == server_fd) {
 
             while (true) {
@@ -122,29 +127,58 @@ int main() {
                 }
 
                 char ip_buffer[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &client.sin_addr,
-                          ip_buffer, INET_ADDRSTRLEN);
+                inet_ntop(AF_INET,
+                          &client.sin_addr,
+                          ip_buffer,
+                          INET_ADDRSTRLEN);
+
                 std::string client_ip(ip_buffer);
+
+                if (blacklist.isBlocked(client_ip)) {
+
+                    std::cout << "[REJECT] Blocked IP attempted connection: "
+                              << client_ip << std::endl;
+
+                    const char* body = "IP temporarily blocked";
+
+                    std::string resp =
+                        "HTTP/1.1 403 Forbidden\r\n"
+                        "Content-Length: " +
+                        std::to_string(strlen(body)) +
+                        "\r\nConnection: close\r\n\r\n" +
+                        std::string(body);
+
+                    send(client_fd, resp.c_str(), resp.size(), 0);
+                    close(client_fd);
+
+                    continue;
+                }
 
                 set_non_blocking(client_fd);
                 reactor.addFd(client_fd, EPOLLIN | EPOLLET);
+
                 connManager.add(client_fd, client_ip);
             }
         }
 
-        // READ
+        // READ EVENT
         else if (events & EPOLLIN) {
 
-            if (!connManager.exists(fd)) return;
+            if (!connManager.exists(fd))
+                return;
 
             char buffer[BUFFER_SIZE];
             auto &conn = connManager.get(fd);
 
             while (true) {
 
-                ssize_t bytes = recv(fd, buffer, sizeof(buffer), 0);
+                ssize_t bytes = recv(fd,
+                                     buffer,
+                                     sizeof(buffer),
+                                     0);
 
                 if (bytes <= 0) {
+
                     if (bytes == -1 && errno == EAGAIN)
                         break;
 
@@ -156,18 +190,8 @@ int main() {
                 conn.read_buffer.append(buffer, bytes);
                 connManager.updateActivity(fd);
 
-                // IP RATE TRACKING
-                ipTracker.recordRequest(conn.client_ip);
-
-                if (ipTracker.getCurrentRate(conn.client_ip)
-                    > MAX_REQUESTS_PER_SEC) {
-
-                    reactor.removeFd(fd);
-                    connManager.remove(fd);
-                    return;
-                }
-
                 if (conn.read_buffer.size() > MAX_REQUEST_SIZE) {
+
                     reactor.removeFd(fd);
                     connManager.remove(fd);
                     return;
@@ -181,14 +205,49 @@ int main() {
 
                 total_requests++;
 
+                // RATE TRACKING (correct place)
+                ipTracker.recordRequest(conn.client_ip);
+
+                if (detector.isSuspicious(conn.client_ip, ipTracker)) {
+                    std::cout << "[THREAT] Suspicious IP detected: "
+                              << conn.client_ip << std::endl;
+
+                    std::cout << "[BLOCK] Blocking IP: "
+                              << conn.client_ip << " for 10 seconds\n";
+                    blacklist.blockIP(conn.client_ip, 10);
+                }
+
+                if (ipTracker.getCurrentRate(conn.client_ip)
+                    > MAX_REQUESTS_PER_SEC) {
+
+                    const char* body = "Too Many Requests";
+
+                    std::string resp =
+                        "HTTP/1.1 429 Too Many Requests\r\n"
+                        "Content-Length: " +
+                        std::to_string(strlen(body)) +
+                        "\r\nConnection: close\r\n\r\n" +
+                        std::string(body);
+
+                    send(fd, resp.c_str(), resp.size(), 0);
+
+                    reactor.removeFd(fd);
+                    connManager.remove(fd);
+                    return;
+                }
+
                 std::string request =
                     conn.read_buffer.substr(0, header_end + 4);
 
                 std::istringstream stream(request);
-                std::string method, path, version;
+
+                std::string method;
+                std::string path;
+                std::string version;
+
                 stream >> method >> path >> version;
 
-                conn.keep_alive =false;
+                conn.keep_alive = false;
 
                 std::string body;
                 std::string response;
@@ -208,16 +267,20 @@ int main() {
                         "HTTP/1.1 200 OK\r\n"
                         "Content-Type: application/json\r\n";
 
-                } else if (path == "/metrics") {
+                }
+                else if (path == "/metrics") {
 
                     body = Metrics::exportMetrics();
+
                     response =
                         "HTTP/1.1 200 OK\r\n"
                         "Content-Type: text/plain\r\n";
 
-                } else {
+                }
+                else {
 
                     body = "Monitoring EPOLLET Server";
+
                     response =
                         "HTTP/1.1 200 OK\r\n"
                         "Content-Type: text/plain\r\n";
@@ -228,9 +291,8 @@ int main() {
                     std::to_string(body.size()) +
                     "\r\n";
 
-                response += conn.keep_alive
-                            ? "Connection: keep-alive\r\n\r\n"
-                            : "Connection: close\r\n\r\n";
+                response +=
+                    "Connection: close\r\n\r\n";
 
                 response += body;
 
@@ -241,10 +303,11 @@ int main() {
             }
         }
 
-        // WRITE
+        // WRITE EVENT
         else if (events & EPOLLOUT) {
 
-            if (!connManager.exists(fd)) return;
+            if (!connManager.exists(fd))
+                return;
 
             auto &conn = connManager.get(fd);
 
@@ -257,6 +320,7 @@ int main() {
                          0);
 
                 if (sent <= 0) {
+
                     if (sent == -1 && errno == EAGAIN)
                         break;
 
@@ -270,18 +334,16 @@ int main() {
 
             if (conn.write_buffer.empty()) {
 
-                if (conn.keep_alive)
-                    reactor.modifyFd(fd, EPOLLIN | EPOLLET);
-                else {
-                    reactor.removeFd(fd);
-                    connManager.remove(fd);
-                }
+                reactor.removeFd(fd);
+                connManager.remove(fd);
             }
         }
 
     });
 
     monitor.stop();
+
     std::cout << "Server stopped.\n";
+
     return 0;
 }
